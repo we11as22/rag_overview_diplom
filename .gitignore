@@ -1,0 +1,28 @@
+# Environment
+01_retrieval_eval/.env
+
+# Vector indices (ChromaDB — can be rebuilt)
+01_retrieval_eval/chroma_db/
+
+# Evaluation results (generated output)
+01_retrieval_eval/results/
+
+# Dataset (downloaded from HuggingFace)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# HuggingFace cache
+.cache/
+
+# OS
+.DS_Store
