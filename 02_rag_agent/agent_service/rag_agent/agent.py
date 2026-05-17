@@ -1,18 +1,20 @@
 """ADK RAG Agent — Wix Knowledge Base Assistant.
 
-Поисковые инструменты (гибридные, alpha=0.6):
-  - search_by_titles      : гибридный поиск по заголовкам
-  - search_by_chunks      : гибридный поиск по содержанию (чанки)
-  - open_article          : сохраняет полный текст в артефакт, возвращает первые N строк
+Поисковые инструменты (гибридные, лучший конфиг по бенчмарку):
+  - search_by_titles  : vector, embeddinggemma, alpha=1.0  (Hit@10=0.73)
+  - search_by_chunks  : linear hybrid, embeddinggemma, alpha=0.6  (MRR@10=0.57)
+  - open_article      : полный текст → сохраняет в PostgreSQL workspace
 
-Инструменты артефактов:
-  - list_saved_articles   : список сохранённых документов
-  - read_article_lines    : чтение артефакта по диапазону строк (как Read в IDE)
-  - search_in_article     : полнотекстовый поиск по конкретному артефакту
-  - search_in_articles    : полнотекстовый поиск по нескольким артефактам
+Инструменты workspace (PostgreSQL, построчно, с fulltext-поиском):
+  - workspace_list    : список всего сохранённого в сессии
+  - workspace_read    : чтение по строкам с offset/limit (как Read в IDE)
+  - workspace_search  : fulltext поиск с контекстом строк (как grep -n -C)
 
 Память: preload_memory_tool + load_memory_tool (PostgresMemoryService).
 Стриминг: автоматически через ADK SSE.
+
+Никаких ADK артефактов — всё хранится в PostgreSQL workspace.
+При удалении сессии workspace автоматически очищается триггером.
 """
 from __future__ import annotations
 
@@ -27,7 +29,6 @@ from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.load_memory_tool import load_memory_tool
 from google.adk.tools.preload_memory_tool import preload_memory_tool
 from google.adk.tools.tool_context import ToolContext
-from google.genai import types
 
 load_dotenv(override=False)
 
@@ -36,18 +37,42 @@ if not os.environ.get("OPENAI_API_KEY"):
 if not os.environ.get("OPENAI_API_BASE"):
     os.environ["OPENAI_API_BASE"] = os.environ.get("LLM_API_BASE", "")
 
-_RAG_URL = os.environ.get("RAG_SERVICE_URL", "http://localhost:8001")
-_ALPHA_CHUNKS = 0.6   # лучший по MRR@10: hybrid_linear, embeddinggemma, α=0.6
-_ALPHA_TITLES = 1.0   # лучший по Hit@10: pure vector, embeddinggemma
-
-_ARTIFACT_PREVIEW_LINES = 80   # строк показывается агенту сразу при open_article
-_ARTIFACT_PAGE_SIZE    = 100   # строк за один вызов read_article_lines
+_RAG_URL      = os.environ.get("RAG_SERVICE_URL", "http://localhost:8001")
+_ALPHA_TITLES = 1.0   # pure vector — лучший по Hit@10 для title search
+_ALPHA_CHUNKS = 0.6   # hybrid linear — лучший по MRR@10 для chunk search
 
 _model = os.environ["LLM_MODEL"]
 _litellm_model = _model if _model.startswith("openai/") else f"openai/{_model}"
 
-# Максимум пар сообщений в контексте LLM
-_MAX_HISTORY_TURNS = 20
+_MAX_HISTORY_TURNS = 20  # пар сообщений в контексте LLM
+_PREVIEW_LINES     = 80  # строк возвращается сразу при open_article
+_WS_PAGE           = 80  # строк за один вызов workspace_read
+
+# ---------------------------------------------------------------------------
+# asyncpg pool (lazy, singleton)
+# ---------------------------------------------------------------------------
+
+_ASYNCPG_DSN = os.environ.get(
+    "DATABASE_URL", "postgresql://rag:rag@localhost:5432/rag"
+).replace("postgresql+asyncpg://", "postgresql://")
+
+
+async def _pool():
+    if not hasattr(_pool, "_p") or _pool._p is None:
+        import asyncpg
+        _pool._p = await asyncpg.create_pool(_ASYNCPG_DSN, min_size=1, max_size=5)
+        # Чистим workspace старше 7 дней при старте пула
+        async with _pool._p.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM agent_workspace WHERE created_at < NOW() - INTERVAL '7 days'"
+            )
+    return _pool._p
+
+_pool._p = None
+
+
+def _sid(tool_context: ToolContext) -> str:
+    return tool_context._invocation_context.session.id
 
 
 # ---------------------------------------------------------------------------
@@ -55,7 +80,6 @@ _MAX_HISTORY_TURNS = 20
 # ---------------------------------------------------------------------------
 
 def _trim_history(callback_context, llm_request) -> None:
-    """Обрезает историю до последних _MAX_HISTORY_TURNS пар."""
     contents = llm_request.contents
     if contents and len(contents) > _MAX_HISTORY_TURNS * 2:
         llm_request.contents = contents[-(_MAX_HISTORY_TURNS * 2):]
@@ -73,36 +97,21 @@ async def _post(path: str, body: dict) -> list | dict:
 
 
 # ---------------------------------------------------------------------------
-# Artifact helpers
-# ---------------------------------------------------------------------------
-
-def _article_filename(article_id: str) -> str:
-    """Имя файла артефакта для статьи."""
-    return f"article_{article_id}.txt"
-
-
-def _lines_preview(text: str, n: int) -> tuple[list[str], int]:
-    """Возвращает первые n строк и общее количество строк."""
-    lines = text.splitlines()
-    return lines[:n], len(lines)
-
-
-# ---------------------------------------------------------------------------
 # Tool 1: поиск по заголовкам
 # ---------------------------------------------------------------------------
 
-async def search_by_titles(query: str, top_k: int = 5) -> str:
-    """Гибридный поиск по заголовкам документов Wix Help Center (BM25 + vector, alpha=0.6).
+async def search_by_titles(query: str, top_k: int = 10) -> str:
+    """Гибридный поиск по заголовкам статей Wix Help Center (vector, alpha=1.0).
 
-    Возвращает список наиболее релевантных статей с кратким содержанием.
-    Используй как первый шаг — чтобы найти какие статьи существуют по теме.
+    Возвращает топ-10 статей: id, title и наиболее релевантный запросу чанк.
+    Используй как первый шаг для любого нового вопроса.
 
     Args:
-        query: Поисковый запрос или вопрос пользователя.
-        top_k: Сколько статей вернуть (1-10, по умолчанию 5).
+        query: Вопрос или поисковый запрос пользователя.
+        top_k: Количество статей (1-10, по умолчанию 10).
 
     Returns:
-        JSON-список: id, title, summary (первые 600 символов), score.
+        JSON-список: id, title, best_chunk, score.
     """
     top_k = max(1, min(top_k, 10))
     results = await _post("/search/hybrid", {
@@ -120,14 +129,14 @@ async def search_by_titles(query: str, top_k: int = 5) -> str:
 # ---------------------------------------------------------------------------
 
 async def search_by_chunks(query: str, top_k: int = 6) -> str:
-    """Гибридный поиск по содержанию документов (чанки, BM25 + vector, alpha=0.6).
+    """Гибридный поиск по содержанию документов (hybrid linear, alpha=0.6).
 
     Ищет конкретные фрагменты текста внутри статей.
-    Используй когда нужны точные инструкции, шаги или детали.
+    Используй когда нужны точные шаги, настройки или детали.
 
     Args:
         query: Конкретный вопрос или аспект для поиска.
-        top_k: Сколько чанков вернуть (1-15, по умолчанию 6).
+        top_k: Количество чанков (1-15, по умолчанию 6).
 
     Returns:
         JSON-список: doc_id, title, chunk_text, score.
@@ -143,32 +152,22 @@ async def search_by_chunks(query: str, top_k: int = 6) -> str:
     ], ensure_ascii=False, indent=2)
 
 
-def _artifacts_enabled(tool_context: ToolContext) -> bool:
-    return tool_context._invocation_context.artifact_service is not None
-
-
-_NO_ARTIFACTS_MSG = json.dumps({
-    "error": "Артефакты не включены. Запусти агента с флагом "
-             "--artifact_service_uri \"file://$HOME/.adk_artifacts\""
-})
-
-
 # ---------------------------------------------------------------------------
-# Tool 3: открыть статью → сохранить артефакт, показать первые строки
+# Tool 3: открыть полный текст статьи → сохранить в workspace
 # ---------------------------------------------------------------------------
 
 async def open_article(article_id: str, tool_context: ToolContext) -> str:
-    """Открыть статью: сохраняет полный текст в артефакт, возвращает первые строки.
+    """Открыть полный текст статьи. Сохраняет её в workspace для дальнейшего чтения.
 
-    Полный текст сохраняется в артефакт — к нему можно обращаться через
-    read_article_lines и search_in_article без повторного обращения к БД.
+    Возвращает первые 80 строк сразу. Если статья длиннее — в ответе будет
+    поле "note" с подсказкой как прочитать остаток через workspace_read.
 
     Args:
         article_id: ID статьи из результатов search_by_titles.
 
     Returns:
-        JSON: title, url, total_lines, preview (первые 80 строк),
-              artifact_name — имя артефакта для дальнейшего чтения.
+        JSON: title, url, workspace_key, total_lines, preview (первые 80 строк),
+              и note если статья обрезана.
     """
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.get(f"{_RAG_URL}/search/article/{article_id}")
@@ -181,280 +180,59 @@ async def open_article(article_id: str, tool_context: ToolContext) -> str:
     title     = data.get("title", "")
     url       = data.get("url", "")
 
-    # Сохраняем полный текст в артефакт (если artifact_service доступен)
-    artifact_name = _article_filename(article_id)
-    artifacts_available = _artifacts_enabled(tool_context)
-    if artifacts_available:
-        await tool_context.save_artifact(
-            filename=artifact_name,
-            artifact=types.Part.from_text(text=full_text),
-            custom_metadata={"title": title, "url": url, "article_id": article_id},
+    # Сохраняем в PostgreSQL workspace построчно
+    ws_key  = f"article_{article_id}"
+    session = _sid(tool_context)
+    lines   = full_text.splitlines()
+    p       = await _pool()
+    async with p.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM agent_workspace WHERE session_id=$1 AND key=$2",
+            session, ws_key,
         )
+        if lines:
+            await conn.executemany(
+                "INSERT INTO agent_workspace(session_id,key,tool_name,line_number,line_text)"
+                " VALUES($1,$2,$3,$4,$5)",
+                [(session, ws_key, "open_article", i + 1, ln)
+                 for i, ln in enumerate(lines)],
+            )
 
-    preview_lines, total_lines = _lines_preview(full_text, _ARTIFACT_PREVIEW_LINES)
-
-    result = {
+    preview = "\n".join(lines[:_PREVIEW_LINES])
+    result  = {
         "title": title,
-        "url": url,
-        "artifact_name": artifact_name if artifacts_available else None,
-        "artifacts_enabled": artifacts_available,
-        "total_lines": total_lines,
-        "showing_lines": f"1-{len(preview_lines)}",
-        "preview": "\n".join(preview_lines),
+        "url":   url,
+        "workspace_key": ws_key,
+        "total_lines":   len(lines),
+        "showing_lines": f"1-{min(_PREVIEW_LINES, len(lines))}",
+        "preview":       preview,
     }
-    if total_lines > _ARTIFACT_PREVIEW_LINES:
-        if artifacts_available:
-            result["note"] = (
-                f"Документ содержит {total_lines} строк. "
-                f"Показаны строки 1-{_ARTIFACT_PREVIEW_LINES}. "
-                f"Используй read_article_lines('{artifact_name}', ...) "
-                f"для чтения остальных строк или search_in_article для поиска."
-            )
-        else:
-            result["note"] = (
-                f"Документ содержит {total_lines} строк, показаны первые {_ARTIFACT_PREVIEW_LINES}. "
-                f"Артефакты не включены — запусти агента с --artifact_service_uri чтобы читать документы целиком."
-            )
-
+    if len(lines) > _PREVIEW_LINES:
+        result["note"] = (
+            f"Статья содержит {len(lines)} строк, показаны первые {_PREVIEW_LINES}. "
+            f"Используй workspace_read('{ws_key}', {_PREVIEW_LINES + 1}) "
+            f"чтобы читать дальше, или workspace_search(query, key='{ws_key}') для поиска."
+        )
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------
-# Tool 4: список сохранённых артефактов
+# Tool 4: список записей workspace
 # ---------------------------------------------------------------------------
-
-async def list_saved_articles(tool_context: ToolContext) -> str:
-    """Показать список статей, открытых в этой сессии (сохранённых в артефакты).
-
-    Returns:
-        JSON-список: artifact_name для каждой сохранённой статьи.
-    """
-    if not _artifacts_enabled(tool_context):
-        return _NO_ARTIFACTS_MSG
-    all_keys = await tool_context.list_artifacts()
-    article_keys = [k for k in all_keys if k.startswith("article_")]
-    return json.dumps({
-        "saved_articles": article_keys,
-        "count": len(article_keys),
-        "hint": "Используй read_article_lines или search_in_article для работы с ними.",
-    }, ensure_ascii=False, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Tool 5: чтение артефакта по строкам
-# ---------------------------------------------------------------------------
-
-async def read_article_lines(
-    artifact_name: str,
-    start_line: int,
-    tool_context: ToolContext,
-    end_line: int | None = None,
-) -> str:
-    """Читать строки из сохранённого артефакта — как чтение файла с позиции.
-
-    Args:
-        artifact_name: Имя артефакта (из open_article или list_saved_articles).
-        start_line: Первая строка (1-based).
-        end_line: Последняя строка включительно (если не задана — start_line + 99).
-
-    Returns:
-        JSON: artifact_name, start_line, end_line, total_lines, content,
-              и has_more если есть ещё строки после end_line.
-    """
-    if not _artifacts_enabled(tool_context):
-        return _NO_ARTIFACTS_MSG
-    part = await tool_context.load_artifact(artifact_name)
-    if part is None:
-        return json.dumps({"error": f"Артефакт '{artifact_name}' не найден. Сначала вызови open_article."})
-
-    lines = part.text.splitlines()
-    total = len(lines)
-    start = max(1, start_line)
-    end   = min(total, end_line if end_line is not None else start + _ARTIFACT_PAGE_SIZE - 1)
-
-    return json.dumps({
-        "artifact_name": artifact_name,
-        "start_line": start,
-        "end_line": end,
-        "total_lines": total,
-        "has_more": end < total,
-        "content": "\n".join(lines[start - 1:end]),
-    }, ensure_ascii=False, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Tool 6: поиск по одному артефакту
-# ---------------------------------------------------------------------------
-
-async def search_in_article(
-    artifact_name: str,
-    pattern: str,
-    tool_context: ToolContext,
-    context_lines: int = 2,
-) -> str:
-    """Полнотекстовый поиск (regex) по конкретному сохранённому документу.
-
-    Args:
-        artifact_name: Имя артефакта (из open_article или list_saved_articles).
-        pattern: Поисковый паттерн (подстрока или регулярное выражение).
-        context_lines: Сколько строк контекста вокруг каждого совпадения (0-5).
-
-    Returns:
-        JSON: список совпадений с номерами строк и контекстом.
-    """
-    if not _artifacts_enabled(tool_context):
-        return _NO_ARTIFACTS_MSG
-    part = await tool_context.load_artifact(artifact_name)
-    if part is None:
-        return json.dumps({"error": f"Артефакт '{artifact_name}' не найден. Сначала вызови open_article."})
-
-    lines = part.text.splitlines()
-    ctx   = max(0, min(context_lines, 5))
-    try:
-        rx = re.compile(pattern, re.IGNORECASE)
-    except re.error:
-        rx = re.compile(re.escape(pattern), re.IGNORECASE)
-
-    matches = []
-    for i, line in enumerate(lines):
-        if rx.search(line):
-            start = max(0, i - ctx)
-            end   = min(len(lines), i + ctx + 1)
-            snippet = []
-            for j in range(start, end):
-                prefix = ">>>" if j == i else "   "
-                snippet.append(f"{prefix} {j+1:>4}: {lines[j]}")
-            matches.append({
-                "line_number": i + 1,
-                "match": line.strip(),
-                "context": "\n".join(snippet),
-            })
-            if len(matches) >= 30:
-                break
-
-    return json.dumps({
-        "artifact_name": artifact_name,
-        "pattern": pattern,
-        "total_matches": len(matches),
-        "matches": matches,
-    }, ensure_ascii=False, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# Tool 7: поиск по нескольким артефактам
-# ---------------------------------------------------------------------------
-
-async def search_in_articles(
-    artifact_names: list[str],
-    pattern: str,
-    tool_context: ToolContext,
-) -> str:
-    """Полнотекстовый поиск по нескольким сохранённым документам сразу.
-
-    Args:
-        artifact_names: Список имён артефактов для поиска.
-        pattern: Поисковый паттерн (подстрока или регулярное выражение).
-
-    Returns:
-        JSON: словарь {artifact_name: список совпадений с номерами строк}.
-    """
-    try:
-        rx = re.compile(pattern, re.IGNORECASE)
-    except re.error:
-        rx = re.compile(re.escape(pattern), re.IGNORECASE)
-
-    results = {}
-    for name in artifact_names:
-        part = await tool_context.load_artifact(name)
-        if part is None:
-            results[name] = {"error": "артефакт не найден"}
-            continue
-        lines = part.text.splitlines()
-        hits = [
-            {"line_number": i + 1, "text": line.strip()}
-            for i, line in enumerate(lines)
-            if rx.search(line)
-        ][:20]
-        results[name] = {"matches": hits, "total": len(hits)}
-
-    return json.dumps({"pattern": pattern, "results": results},
-                      ensure_ascii=False, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# PostgreSQL Workspace — persist tool outputs, read by lines, search
-# Паттерн из Hermes: большие выводы сохраняются построчно,
-# агент читает их через offset/limit и ищет через fulltext.
-# ---------------------------------------------------------------------------
-
-_ASYNCPG_DSN = os.environ.get(
-    "DATABASE_URL", "postgresql://rag:rag@localhost:5432/rag"
-).replace("postgresql+asyncpg://", "postgresql://")
-
-_WS_PAGE = 80   # строк за один вызов workspace_read по умолчанию
-
-
-async def _ws_pool():
-    """Lazy asyncpg pool — создаётся один раз при первом вызове."""
-    if not hasattr(_ws_pool, "_pool") or _ws_pool._pool is None:
-        import asyncpg
-        _ws_pool._pool = await asyncpg.create_pool(_ASYNCPG_DSN, min_size=1, max_size=5)
-    return _ws_pool._pool
-
-_ws_pool._pool = None
-
-
-async def workspace_write(key: str, content: str, tool_context: ToolContext) -> str:
-    """Сохранить текст в рабочее пространство сессии построчно.
-
-    Используй чтобы сохранить большой вывод инструмента для последующего
-    чтения и поиска — как запись в файл. Перезаписывает предыдущую запись с тем же key.
-
-    Args:
-        key:     Имя записи (латиницей, без пробелов). Например: "search_results", "article_abc".
-        content: Текст для сохранения (любой, в том числе многострочный).
-
-    Returns:
-        JSON: key, total_lines, session_id.
-    """
-    session_id = tool_context._invocation_context.session.id
-    lines = content.splitlines()
-    pool = await _ws_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "DELETE FROM agent_workspace WHERE session_id=$1 AND key=$2",
-            session_id, key,
-        )
-        if lines:
-            await conn.executemany(
-                """INSERT INTO agent_workspace (session_id, key, tool_name, line_number, line_text)
-                   VALUES ($1, $2, $3, $4, $5)""",
-                [
-                    (session_id, key, "workspace_write", i + 1, line)
-                    for i, line in enumerate(lines)
-                ],
-            )
-    return json.dumps({"key": key, "total_lines": len(lines), "session_id": session_id})
-
 
 async def workspace_list(tool_context: ToolContext) -> str:
-    """Показать все записи в рабочем пространстве текущей сессии.
+    """Показать все записи сохранённые в workspace текущей сессии.
 
     Returns:
-        JSON: список записей с key, total_lines, created_at.
+        JSON-список: key, total_lines, created_at для каждой записи.
     """
-    session_id = tool_context._invocation_context.session.id
-    pool = await _ws_pool()
-    async with pool.acquire() as conn:
+    p = await _pool()
+    async with p.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT key,
-                      COUNT(*)        AS total_lines,
-                      MIN(created_at) AS created_at
-               FROM agent_workspace
-               WHERE session_id = $1
-               GROUP BY key
-               ORDER BY MIN(created_at)""",
-            session_id,
+            """SELECT key, COUNT(*) AS total_lines, MIN(created_at) AS created_at
+               FROM agent_workspace WHERE session_id=$1
+               GROUP BY key ORDER BY MIN(created_at)""",
+            _sid(tool_context),
         )
     return json.dumps(
         [{"key": r["key"], "total_lines": r["total_lines"],
@@ -463,53 +241,61 @@ async def workspace_list(tool_context: ToolContext) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# Tool 5: чтение workspace по строкам
+# ---------------------------------------------------------------------------
+
 async def workspace_read(
     key: str,
     tool_context: ToolContext,
     start_line: int = 1,
     end_line: int | None = None,
 ) -> str:
-    """Читать строки из записи рабочего пространства — как read_file с offset/limit.
+    """Читать строки из записи workspace — как чтение файла с позиции.
 
     Args:
-        key:        Имя записи (из workspace_list).
-        start_line: Первая строка (1-based).
-        end_line:   Последняя строка включительно (если не задана — start + 79).
+        key:        Имя записи (из workspace_list или workspace_key из open_article).
+        start_line: Первая строка 1-based (по умолчанию 1).
+        end_line:   Последняя строка включительно (по умолчанию start + 79).
 
     Returns:
-        JSON: key, start_line, end_line, total_lines, has_more, lines (список строк с номерами).
+        JSON: key, start_line, end_line, total_lines, has_more,
+              lines — список {n: номер, text: текст строки}.
     """
-    session_id = tool_context._invocation_context.session.id
+    session = _sid(tool_context)
     if end_line is None:
         end_line = start_line + _WS_PAGE - 1
 
-    pool = await _ws_pool()
-    async with pool.acquire() as conn:
+    p = await _pool()
+    async with p.acquire() as conn:
         total = await conn.fetchval(
             "SELECT COUNT(*) FROM agent_workspace WHERE session_id=$1 AND key=$2",
-            session_id, key,
+            session, key,
         )
-        if total == 0:
-            return json.dumps({"error": f"Запись '{key}' не найдена. Используй workspace_list."})
-
+        if not total:
+            return json.dumps({
+                "error": f"Запись '{key}' не найдена. Используй workspace_list."
+            })
         rows = await conn.fetch(
-            """SELECT line_number, line_text
-               FROM agent_workspace
-               WHERE session_id=$1 AND key=$2
-                 AND line_number BETWEEN $3 AND $4
+            """SELECT line_number, line_text FROM agent_workspace
+               WHERE session_id=$1 AND key=$2 AND line_number BETWEEN $3 AND $4
                ORDER BY line_number""",
-            session_id, key, start_line, end_line,
+            session, key, start_line, end_line,
         )
 
     return json.dumps({
-        "key": key,
+        "key":        key,
         "start_line": start_line,
-        "end_line": min(end_line, total),
+        "end_line":   min(end_line, total),
         "total_lines": total,
-        "has_more": end_line < total,
-        "lines": [{"n": r["line_number"], "text": r["line_text"]} for r in rows],
+        "has_more":   end_line < total,
+        "lines":      [{"n": r["line_number"], "text": r["line_text"]} for r in rows],
     }, ensure_ascii=False)
 
+
+# ---------------------------------------------------------------------------
+# Tool 6: fulltext поиск по workspace
+# ---------------------------------------------------------------------------
 
 async def workspace_search(
     pattern: str,
@@ -517,71 +303,63 @@ async def workspace_search(
     key: str | None = None,
     context_lines: int = 2,
 ) -> str:
-    """Полнотекстовый поиск по рабочему пространству сессии.
+    """Fulltext поиск по workspace сессии — как grep -n -C.
 
-    Поиск по всем записям или по конкретной. Возвращает номера строк
-    и контекст вокруг каждого совпадения — как grep -n -C.
+    Возвращает номера строк и контекст вокруг каждого совпадения.
 
     Args:
-        pattern:       Поисковый запрос (слова через пробел) или фраза.
+        pattern:       Поисковый запрос (слова или фраза).
         key:           Искать только в этой записи (если не задан — по всем).
         context_lines: Строк контекста вокруг совпадения (0-5, по умолчанию 2).
 
     Returns:
-        JSON: список совпадений с key, line_number, matched_line, context.
+        JSON: total совпадений, matches — список {key, line_number, context}.
     """
-    session_id = tool_context._invocation_context.session.id
-    context_lines = max(0, min(context_lines, 5))
-    pool = await _ws_pool()
+    session = _sid(tool_context)
+    ctx     = max(0, min(context_lines, 5))
+    p       = await _pool()
 
-    async with pool.acquire() as conn:
-        # Fulltext поиск через tsvector — находим (key, line_number) совпадений
+    async with p.acquire() as conn:
         if key:
-            hit_rows = await conn.fetch(
-                """SELECT key, line_number
-                   FROM agent_workspace
+            hits = await conn.fetch(
+                """SELECT key, line_number FROM agent_workspace
                    WHERE session_id=$1 AND key=$2
                      AND to_tsvector('english', line_text) @@ plainto_tsquery('english', $3)
-                   ORDER BY key, line_number
-                   LIMIT 30""",
-                session_id, key, pattern,
+                   ORDER BY line_number LIMIT 30""",
+                session, key, pattern,
             )
         else:
-            hit_rows = await conn.fetch(
-                """SELECT key, line_number
-                   FROM agent_workspace
+            hits = await conn.fetch(
+                """SELECT key, line_number FROM agent_workspace
                    WHERE session_id=$1
                      AND to_tsvector('english', line_text) @@ plainto_tsquery('english', $2)
-                   ORDER BY key, line_number
-                   LIMIT 30""",
-                session_id, pattern,
+                   ORDER BY key, line_number LIMIT 30""",
+                session, pattern,
             )
 
-        if not hit_rows:
-            return json.dumps({"pattern": pattern, "matches": [], "total": 0})
+        if not hits:
+            return json.dumps({"pattern": pattern, "total": 0, "matches": []})
 
-        # Для каждого совпадения — дотянуть контекстные строки
         results = []
-        for hit in hit_rows:
-            ctx_start = max(1, hit["line_number"] - context_lines)
-            ctx_end   = hit["line_number"] + context_lines
-            ctx_rows  = await conn.fetch(
-                """SELECT line_number, line_text
-                   FROM agent_workspace
+        for hit in hits:
+            ctx_rows = await conn.fetch(
+                """SELECT line_number, line_text FROM agent_workspace
                    WHERE session_id=$1 AND key=$2
                      AND line_number BETWEEN $3 AND $4
                    ORDER BY line_number""",
-                session_id, hit["key"], ctx_start, ctx_end,
+                session, hit["key"],
+                max(1, hit["line_number"] - ctx),
+                hit["line_number"] + ctx,
             )
-            context_text = "\n".join(
-                f"{'>>>' if r['line_number'] == hit['line_number'] else '   '} "
-                f"{r['line_number']:>4}: {r['line_text']}"
+            context_str = "\n".join(
+                f"{'>>>' if r['line_number'] == hit['line_number'] else '   '}"
+                f" {r['line_number']:>4}: {r['line_text']}"
                 for r in ctx_rows
             )
             results.append({
-                "key": hit["key"],
+                "key":         hit["key"],
                 "line_number": hit["line_number"],
-                "context": context_text,
+                "context":     context_str,
             })
 
     return json.dumps({"pattern": pattern, "total": len(results), "matches": results},
@@ -605,79 +383,50 @@ root_agent = Agent(
 отвечаешь кратко если вопрос простой и подробно если сложный.
 Не начинай каждый ответ с поиска — сначала пойми что человек хочет.
 
-## Когда искать, а когда нет
+## Когда искать
 
-Отвечай БЕЗ поиска если:
-- это уточнение или продолжение предыдущего ответа ("а как это выглядит?", "и что дальше?")
-- ты уже нашёл нужную информацию в этой сессии
-- вопрос о чём-то что ты уже объяснял
+Ищи когда: новая тема, нужны конкретные шаги/настройки, пользователь просит найти документацию.
+Не ищи когда: уточнение предыдущего ответа, информация уже найдена в этой сессии.
 
-Ищи когда:
-- новая тема или новый вопрос
-- тебе нужны конкретные шаги/настройки которых ты не знаешь наверняка
-- пользователь явно просит найти документацию
+## Инструменты поиска
 
-## Как вести диалог
+**search_by_titles(query, top_k=10)**
+Поиск по заголовкам статей. Возвращает id, title и наиболее релевантный чанк.
+Используй первым для любого нового вопроса.
 
-- Если вопрос расплывчатый — уточни прежде чем искать: "Ты имеешь в виду X или Y?"
-- Не пересказывай весь JSON из инструментов — выдели главное
-- Если нашёл несколько статей — кратко объясни что в каждой, спроси что интересует больше
-- Если что-то не нашлось — скажи честно и предложи альтернативный поиск
-- Отвечай на языке пользователя
+**search_by_chunks(query, top_k=6)**
+Поиск по содержанию (фрагменты текста). Используй когда нужны конкретные шаги или детали.
 
-## Поисковые инструменты (используй по необходимости)
+**open_article(article_id)**
+Полный текст статьи. Сохраняет в workspace, возвращает первые 80 строк.
+Если есть поле "note" — статья длиннее, читай дальше через workspace_read.
 
-**search_by_titles** — быстрый обзор: какие статьи вообще есть по теме.
-Хорош как первый шаг когда тема новая.
+## Инструменты workspace
 
-**search_by_chunks** — поиск внутри документов по содержанию.
-Используй когда нужны конкретные шаги, параметры, инструкции.
-Можно вызывать с уточнённым запросом прямо по теме ("как подключить домен", "настройка SEO").
+Workspace — это построчное хранилище текущей сессии в PostgreSQL.
+Всё что сохранено через open_article доступно здесь.
 
-**open_article(article_id)** — сохраняет полную статью в артефакт, показывает первые 80 строк.
-Если в ответе есть поле "note" — статья длиннее, остаток читай через read_article_lines.
+**workspace_list()** — список всего сохранённого (key и количество строк).
 
-## Инструменты артефактов (для работы с открытыми статьями)
+**workspace_read(key, start_line, end_line)** — читать строки с позиции.
+Возвращает has_more=true если есть ещё строки после end_line.
 
-**list_saved_articles()** — список статей открытых в этой сессии.
+**workspace_search(pattern, key=None)** — fulltext поиск по сохранённым документам.
+Возвращает номера строк и контекст ±2 строки вокруг совпадения.
+key — искать только в одной записи; если не задан — по всем.
 
-**read_article_lines(artifact_name, start_line, end_line)** — читать статью с нужной строки.
-Используй когда open_article вернул "note" об обрезке.
-
-**search_in_article(artifact_name, pattern)** — regex/текстовый поиск по конкретной статье.
-Удобно когда статья большая и нужно найти конкретный термин или раздел.
-
-**search_in_articles(artifact_names, pattern)** — поиск по нескольким открытым статьям.
-
-## Рабочее пространство (PostgreSQL workspace)
-
-Персистентное хранилище для больших выводов инструментов — построчно, с поиском.
-Данные живут в рамках сессии. Паттерн: сохранил → читай по частям → ищи.
-
-**workspace_write(key, content)** — сохранить текст построчно. key — короткое имя (напр. "search_results_domain").
-
-**workspace_list()** — список всех записей с количеством строк.
-
-**workspace_read(key, start_line, end_line)** — читать строки с позиции. Возвращает has_more если есть ещё.
-
-**workspace_search(pattern, key=None)** — fulltext поиск по workspace. Возвращает номера строк и контекст ±2 строки вокруг совпадения (как grep -n -C 2).
-
-## Формат ответа
+## Как отвечать
 
 - Короткий вопрос → короткий ответ (2-5 предложений)
 - Пошаговая инструкция → нумерованный список
-- Всегда указывай источник в конце: *Источник: [название статьи]*
-- Если не уверен — скажи об этом явно, не придумывай
+- Указывай источник: *Источник: [название статьи]*
+- Если не уверен — скажи об этом, не придумывай
+- Отвечай на языке пользователя
 """,
     tools=[
         search_by_titles,
         search_by_chunks,
         open_article,
-        list_saved_articles,
-        read_article_lines,
-        search_in_article,
-        search_in_articles,
-        workspace_write,
         workspace_list,
         workspace_read,
         workspace_search,

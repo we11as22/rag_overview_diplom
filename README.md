@@ -201,7 +201,7 @@ adk web --host 0.0.0.0 --port 8000 \
 ### Однострочный запуск агента (из папки agent_service/, заполнить переменные)
 
 ```bash
-OPENAI_API_BASE="..." OPENAI_API_KEY="..." LLM_MODEL="..." RAG_SERVICE_URL="http://localhost:8001" DATABASE_URL="postgresql://rag:rag@localhost:5432/rag" adk web --host 0.0.0.0 --port 8000 --artifact_service_uri "file://$HOME/.adk_artifacts" --memory_service_uri "pgmemory://localhost" .
+OPENAI_API_BASE="..." OPENAI_API_KEY="..." LLM_MODEL="..." RAG_SERVICE_URL="http://localhost:8001" DATABASE_URL="postgresql://rag:rag@localhost:5432/rag" adk web --host 0.0.0.0 --port 8000 --session_service_uri "pgclean://localhost" --memory_service_uri "pgmemory://localhost" .
 ```
 
 ---

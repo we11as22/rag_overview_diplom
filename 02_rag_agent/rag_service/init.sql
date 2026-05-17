@@ -34,3 +34,38 @@ CREATE INDEX IF NOT EXISTS chunks_doc_id_idx ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS chunks_fts_idx    ON chunks USING GIN(fts);
 CREATE INDEX IF NOT EXISTS chunks_vec_idx    ON chunks USING hnsw(chunk_vec vector_cosine_ops)
     WITH (m = 16, ef_construction = 64);
+
+-- Agent workspace: построчное хранилище выводов инструментов
+-- Область видимости: session_id, TTL 7 дней
+CREATE TABLE IF NOT EXISTS agent_workspace (
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  TEXT        NOT NULL,
+    key         TEXT        NOT NULL,
+    tool_name   TEXT,
+    line_number INT         NOT NULL,
+    line_text   TEXT        NOT NULL DEFAULT '',
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (session_id, key, line_number)
+);
+
+CREATE INDEX IF NOT EXISTS ws_session_key_idx ON agent_workspace(session_id, key);
+CREATE INDEX IF NOT EXISTS ws_key_line_idx    ON agent_workspace(session_id, key, line_number);
+CREATE INDEX IF NOT EXISTS ws_fts_idx         ON agent_workspace USING GIN(to_tsvector('english', line_text));
+CREATE INDEX IF NOT EXISTS ws_created_at_idx  ON agent_workspace(created_at);
+
+-- Agent memory: персистентная память между сессиями
+CREATE TABLE IF NOT EXISTS agent_memory (
+    id          BIGSERIAL PRIMARY KEY,
+    app_name    TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    session_id  TEXT,
+    author      TEXT,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    content_json TEXT NOT NULL,
+    fts         TSVECTOR GENERATED ALWAYS AS (
+                    to_tsvector('english', content_json)
+                ) STORED
+);
+
+CREATE INDEX IF NOT EXISTS agent_memory_user_idx ON agent_memory(app_name, user_id);
+CREATE INDEX IF NOT EXISTS agent_memory_fts_idx  ON agent_memory USING GIN(fts);
