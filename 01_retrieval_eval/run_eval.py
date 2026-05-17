@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 from embeddings import OllamaEmbedder
-from evaluate import aevaluate_retriever, aevaluate_hybrid_batch
+from evaluate import aevaluate_retriever, aevaluate_hybrid_batch, filter_single_article
 from retrieval import BM25Retriever, VectorRetriever
 from retrieval.chain_rag_retriever import (
     ChainRAGRetriever, ChunkIndex, TitleBM25Retriever, _LLMClient,
@@ -45,8 +45,13 @@ def load_qa(dry_run: bool = False) -> List[dict]:
         sys.exit(f"[ERROR] QA data not found at {path}. Run `python download_data.py` first.")
     with path.open(encoding="utf-8") as f:
         rows = [json.loads(line) for line in f if line.strip()]
+
+    # Оцениваем только на single-article парах — однозначная метрика
+    rows = filter_single_article(rows)
+    print(f"[filter] Using {len(rows)} single-article QA pairs (out of 200 total)")
+
     if dry_run:
-        print(f"[dry-run] Using first 5 queries out of {len(rows)}")
+        print(f"[dry-run] Using first 5 queries")
         rows = rows[:5]
     return rows
 

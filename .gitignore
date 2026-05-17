@@ -1,13 +1,17 @@
 # Environment
 01_retrieval_eval/.env
+02_rag_agent/.env
+02_rag_agent/agent_service/.env
 
 # Vector indices (ChromaDB — can be rebuilt)
 01_retrieval_eval/chroma_db/
 
-# Evaluation results (generated output)
-01_retrieval_eval/results/
+# Evaluation results — коммитим отчёты, но не сырые JSON с большими данными
+# results/report.md и results/title_search_report.md — в репо
+# results/results.json и results/title_search_results.json — тоже в репо (небольшие)
+# НЕ игнорируем results/ полностью
 
-# Dataset (downloaded from HuggingFace)
+# Dataset (downloaded from HuggingFace — большой, не коммитим)
 data/
 
 # Python
@@ -23,6 +27,16 @@ build/
 
 # HuggingFace cache
 .cache/
+
+# ADK runtime data (сессии, артефакты сессий)
+02_rag_agent/agent_service/.adk/
+02_rag_agent/agent_service/rag_agent/.adk/
+
+# ADK artifacts (локальная память агента)
+.adk_artifacts/
+
+# PostgreSQL Docker volume
+02_rag_agent/pgdata/
 
 # OS
 .DS_Store
