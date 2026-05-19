@@ -22,5 +22,51 @@ services:
       interval: 5s
       retries: 10
 
+  rag_service:
+    build: ./rag_service
+    ports:
+      - "8001:8001"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://rag:rag@postgres:5432/rag
+      # Не подставлять OLLAMA_BASE_URL из .env (там localhost для start.sh)
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
+      EMBED_MODEL: ${EMBED_MODEL:-embeddinggemma}
+      EMBED_DIM: ${EMBED_DIM:-768}
+    volumes:
+      - ../data:/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 10s
+      retries: 12
+
+  agent_service:
+    # google-genai/google-adk: arm64 wheels SIGILL на Apple Silicon → amd64 + QEMU
+    platform: linux/amd64
+    build: ./agent_service
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      SESSION_SERVICE_URI: pgclean://localhost
+      MEMORY_SERVICE_URI: pgmemory://localhost
+      ADK_DISABLE_LOCAL_STORAGE: "1"
+      RAG_SERVICE_URL: http://rag_service:8001
+      DATABASE_URL: postgresql://rag:rag@postgres:5432/rag
+      OPENAI_API_BASE: ${OPENAI_API_BASE}
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      LLM_API_BASE: ${OPENAI_API_BASE}
+      LLM_API_KEY: ${OPENAI_API_KEY}
+      LLM_MODEL: ${LLM_MODEL}
+    depends_on:
+      rag_service:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
 volumes:
   pgdata:

@@ -46,6 +46,7 @@ rag_overview_diplom/
     │       └── search.py          # /search/hybrid, /search/chunks, /search/article
     └── agent_service/             # Google ADK агент
         ├── Dockerfile
+        ├── main.py                # get_fast_api_app + uvicorn (официальный паттерн)
         ├── requirements.txt
         ├── memory_service.py      # PostgresMemoryService (персистентная память)
         ├── services.py            # регистрация pgmemory:// схемы в ADK
@@ -115,93 +116,101 @@ Ollama (локально, порт 11434) — НЕ в Docker
 
 ---
 
-## Быстрый старт
+## Быстрый старт (рекомендуется: Ollama на хосте)
 
 ### Требования
 
-- Docker Desktop
+- [Ollama](https://ollama.ai) на хосте: `ollama pull embeddinggemma`
+- Docker Desktop — только для PostgreSQL
 - Python 3.12+
-- [Ollama](https://ollama.ai) запущен локально
-- Модель эмбеддингов: `ollama pull embeddinggemma`
 
-### 1. Клонировать и настроить
+---
+
+### Шаг 1. Клонировать и настроить `.env`
 
 ```bash
 git clone <repo>
 cd rag_overview_diplom/02_rag_agent
 
 cp .env.example .env
-# Заполнить: LLM_API_BASE, LLM_API_KEY, LLM_MODEL
+# Заполнить: OPENAI_API_BASE, OPENAI_API_KEY, LLM_MODEL
 ```
 
-### 2. Поднять PostgreSQL
+---
 
-```bash
-docker compose up -d
-# Ждём healthy: docker compose ps
-```
-
-### 3. Скачать датасет (один раз)
+### Шаг 2. Скачать датасет (один раз, ~60 МБ)
 
 ```bash
 cd ../01_retrieval_eval
-pip install -r requirements.txt
+pip install datasets
 python download_data.py
 cd ../02_rag_agent
 ```
 
-### 4. Установить зависимости
+---
+
+### Шаг 3. PostgreSQL в Docker, rag + agent локально
 
 ```bash
-pip install -r rag_service/requirements.txt -r agent_service/requirements.txt
+docker compose up -d postgres
+./start.sh
 ```
 
-### 5. Запустить rag_service (из папки rag_service/)
+Открыть: **http://localhost:8000** (ADK UI)
+
+Ollama и эмбеддинги — как раньше, на хосте (`OLLAMA_BASE_URL=http://localhost:11434` в `.env`).
+
+---
+
+### Шаг 4. Загрузить корпус в PostgreSQL (один раз, ~30–60 мин)
 
 ```bash
-cd rag_service
-DATABASE_URL="postgresql+asyncpg://rag:rag@localhost:5432/rag" \
-OLLAMA_BASE_URL="http://localhost:11434" \
-EMBED_MODEL="embeddinggemma" \
-EMBED_DIM="768" \
-uvicorn main:app --port 8001
-```
-
-Оставь терминал открытым. В новом терминале:
-
-### 6. Загрузить корпус (один раз, ~30–60 мин)
-
-```bash
-cd 02_rag_agent   # если ушёл в rag_service — вернись на уровень выше
+pip install httpx
 python ingest.py
-# Прогресс видно в логах rag_service
+# Прогресс в stdout ingest.py (rag_service на :8001)
 ```
 
-### 7. Запустить агента (из папки agent_service/)
+---
+
+### Опционально: rag + agent в Docker
 
 ```bash
-mkdir -p ~/.adk_artifacts
-cd agent_service
-
-OPENAI_API_BASE="<your_api_base>" \
-OPENAI_API_KEY="<your_key>" \
-LLM_MODEL="<model_name>" \
-RAG_SERVICE_URL="http://localhost:8001" \
-DATABASE_URL="postgresql://rag:rag@localhost:5432/rag" \
-adk web --host 0.0.0.0 --port 8000 \
-  --artifact_service_uri "file://$HOME/.adk_artifacts" \
-  --memory_service_uri "pgmemory://localhost" \
-  .
+docker compose up --build
+python ingest.py --docker-rag          # корпус читается внутри контейнера rag
 ```
 
-Открыть: **http://localhost:8000**
+Ollama для `rag_service` в compose: `OLLAMA_BASE_URL_DOCKER` (по умолчанию `host.docker.internal`).  
+В `.env` оставь `OLLAMA_BASE_URL=http://localhost:11434` — он для `./start.sh`, не подмешивается в rag-контейнер.  
+На **Apple Silicon** `agent_service` — `linux/amd64` (exit **132** на arm64).  
+Если поиск 500 (Ollama недоступен из Docker) — используй `./start.sh`.
 
-> **Примечание:** "Failed to fetch artifact data" в UI при открытии — это ADK пытается показать артефакты предыдущей сессии. Не влияет на работу агента. Исчезнет при запуске с `--session_db_url`.
+### Паритет Docker / локально
 
-### Однострочный запуск агента (из папки agent_service/, заполнить переменные)
+| Функция | `./start.sh` + postgres | `docker compose` (всё в контейнерах) |
+|--------|-------------------------|--------------------------------------|
+| Поиск title/chunk, open_article | ✓ | ✓ если Ollama доступен с хоста |
+| workspace_* (PostgreSQL) | ✓ | ✓ |
+| preload/load memory | ✓ | ✓ |
+| Удаление сессии → память + чистка workspace | ✓ | ✓ |
+| ADK Web UI + chat SSE | ✓ | ✓ |
+| Ingest корпуса | `python ingest.py` | `python ingest.py --docker-rag` |
+| Граф агента в dev-ui (`/dev/build_graph`) | 500 (LiteLlm) | то же — не ломает чат |
+
+Сессии ADK (`pgclean`) — **in-memory до перезапуска** агента; в Postgres остаются workspace, memory после delete сессии.
+
+### Логи (режим full Docker)
 
 ```bash
-OPENAI_API_BASE="..." OPENAI_API_KEY="..." LLM_MODEL="..." RAG_SERVICE_URL="http://localhost:8001" DATABASE_URL="postgresql://rag:rag@localhost:5432/rag" adk web --host 0.0.0.0 --port 8000 --session_service_uri "pgclean://localhost" --memory_service_uri "pgmemory://localhost" .
+docker compose logs -f                    # все сервисы
+docker compose logs -f agent_service      # только агент
+docker compose logs -f rag_service        # только RAG API
+```
+
+### Остановка
+
+```bash
+docker compose down        # остановить, данные сохранить
+docker compose down -v     # остановить + удалить данные PostgreSQL
 ```
 
 ---

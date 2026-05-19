@@ -17,10 +17,15 @@ set -a; source "$ENV_FILE"; set +a
 export DATABASE_URL="${DATABASE_URL:-postgresql+asyncpg://rag:rag@localhost:5432/rag}"
 export OLLAMA_BASE_URL="${OLLAMA_BASE_URL:-http://localhost:11434}"
 export EMBED_MODEL="${EMBED_MODEL:-embeddinggemma}"
-export EMBED_DIM="${EMBED_DIM:-3072}"
+export EMBED_DIM="${EMBED_DIM:-768}"
 export RAG_SERVICE_URL="${RAG_SERVICE_URL:-http://localhost:8001}"
-export OPENAI_API_BASE="$LLM_API_BASE"
-export OPENAI_API_KEY="$LLM_API_KEY"
+export LLM_MODEL="${LLM_MODEL:?Задай LLM_MODEL в .env}"
+export OPENAI_API_BASE="${LLM_API_BASE:?Задай LLM_API_BASE в .env}"
+export OPENAI_API_KEY="${LLM_API_KEY:?Задай LLM_API_KEY в .env}"
+export PORT="${PORT:-8000}"
+export SESSION_SERVICE_URI="${SESSION_SERVICE_URI:-pgclean://localhost}"
+export MEMORY_SERVICE_URI="${MEMORY_SERVICE_URI:-pgmemory://localhost}"
+export ADK_DISABLE_LOCAL_STORAGE="${ADK_DISABLE_LOCAL_STORAGE:-1}"
 
 echo "==> Запускаем rag_service на :8001 ..."
 cd "$SCRIPT_DIR/rag_service"
@@ -39,10 +44,10 @@ for i in $(seq 1 20); do
   echo -n "."
 done
 
-echo "==> Запускаем agent_service (adk web) на :8000 ..."
+echo "==> Запускаем agent_service (uvicorn) на :8000 ..."
 cd "$SCRIPT_DIR/agent_service"
 pip install -q -r requirements.txt
-adk web --host 0.0.0.0 --port 8000 . &
+uvicorn main:app --host 0.0.0.0 --port "$PORT" &
 AGENT_PID=$!
 
 echo ""
