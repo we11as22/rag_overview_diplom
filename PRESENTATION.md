@@ -34,7 +34,7 @@ corpus (4172) + QA (148)  →  BM25 | vector | hybrid (linear, RRF)
 \* MRR@20 / Hit@20 = 0.818 для vector title
 
 **В агенте:** chunks α=**0.7**, k=**8** (k=15 — 95% recall) · titles α=**1.0**, k=**10** · **embeddinggemma**  
-Полные таблицы: `01_retrieval_eval/results/` · отчёт: `EXPERIMENTS.md`
+Полные таблицы: `01_retrieval_eval/results/` · обоснование: `RETRIEVAL_SELECTION.md`
 
 ---
 

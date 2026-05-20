@@ -1,6 +1,6 @@
 """ADK RAG Agent — Wix Knowledge Base Assistant.
 
-Поисковые инструменты (конфиг из 01_retrieval_eval, см. EXPERIMENTS.md):
+Поисковые инструменты (конфиг из 01_retrieval_eval, см. RETRIEVAL_SELECTION.md):
   - search_by_titles  : vector, embeddinggemma, alpha=1.0, top_k=10  (Hit@10=0.74)
   - search_by_chunks  : hybrid linear, embeddinggemma, alpha=0.7, top_k=8  (MRR@10=0.58)
   - open_article      : полный текст → PostgreSQL workspace

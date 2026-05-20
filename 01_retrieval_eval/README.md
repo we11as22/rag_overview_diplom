@@ -9,7 +9,8 @@
 | `search_by_chunks` | hybrid linear | embeddinggemma | **0.7** | **8** | MRR@10 **0.577** |
 | `search_by_titles` | vector | embeddinggemma | **1.0** | **10** | Hit@10 **0.743** |
 
-Корпус: **4172** док. (без `feature_request`), QA: **148**. Сводка: [../EXPERIMENTS.md](../EXPERIMENTS.md).
+Корпус: **4172** док. (без `feature_request`), QA: **148**.  
+Обоснование подбора: [../RETRIEVAL_SELECTION.md](../RETRIEVAL_SELECTION.md) · сводка: [../EXPERIMENTS.md](../EXPERIMENTS.md).
 
 ## Методы
 

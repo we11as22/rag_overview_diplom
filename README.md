@@ -6,7 +6,8 @@
 01_retrieval_eval/   бенчмарк (Chroma + Ollama)
 02_rag_agent/         rag_service + agent_service (PG + ADK)
 data/                 corpus + QA (download_data.py)
-EXPERIMENTS.md        отчёт по экспериментам и принятые конфиги
+EXPERIMENTS.md        сводка экспериментов и цифры
+RETRIEVAL_SELECTION.md  обоснование подбора метода, α и top_k
 PRESENTATION.md       слайды (копипаст)
 ```
 
@@ -22,7 +23,7 @@ PRESENTATION.md       слайды (копипаст)
 | `search_by_chunks` | hybrid linear, **α=0.7**, **top_k=8** |
 | `search_by_titles` | vector, **α=1.0**, **top_k=10** |
 
-Подробности и таблицы экспериментов: **[EXPERIMENTS.md](EXPERIMENTS.md)**
+Обоснование подбора: **[RETRIEVAL_SELECTION.md](RETRIEVAL_SELECTION.md)** · таблицы: **[EXPERIMENTS.md](EXPERIMENTS.md)**
 
 ---
 

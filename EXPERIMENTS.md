@@ -3,6 +3,8 @@
 Датасет: [Wix/WixQA](https://huggingface.co/datasets/Wix/WixQA).  
 Дата прогона: май 2026. Полный цикл: `01_retrieval_eval/run_validation.py`.
 
+**Почему выбраны метод, α и top_k:** [RETRIEVAL_SELECTION.md](RETRIEVAL_SELECTION.md)
+
 ## Данные и фильтры
 
 | Параметр | Значение |

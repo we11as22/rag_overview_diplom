@@ -1,7 +1,7 @@
 # Подбор top_k для агента
 
 **α чанков:** 0.7 (лучший MRR@10 в `report.md`)  
-**Применено в агенте:** `search_by_chunks` top_k=**8** (операционный), `search_by_titles` top_k=**10** — см. `EXPERIMENTS.md`
+**Применено в агенте:** `search_by_chunks` top_k=**8** (операционный), `search_by_titles` top_k=**10** — см. `RETRIEVAL_SELECTION.md`
 
 EVAL_KS в .env: `[1, 3, 5, 6, 8, 10, 15, 20]`
 
