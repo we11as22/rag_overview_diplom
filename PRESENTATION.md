@@ -6,41 +6,44 @@
 
 **Сравнение стратегий retrieval в RAG и прототип агента поддержки**
 
-Датасет: **Wix/WixQA** — 6 221 статья, **148** QA (single-article)  
-Метрика: **MRR@10** (чанки), **Hit@10** (заголовки)
+Датасет: **Wix/WixQA** — 6 221 → **4 172** в индексе (без `feature_request`), **148** single-article QA  
+Метрики: **MRR@10** (чанки), **Hit@10** (заголовки) · 3 embed-модели, sweep α и k · **без chain-of-RAG**
 
 ---
 
-## 2. Подбор поиска
+## 2. Эксперименты retrieval
 
 ```
-corpus + QA  →  BM25 | vector | hybrid (linear, RRF)
-                      ↓
-              3 embed-модели (Ollama)
-                      ↓
-              sweep α, MRR@10 / Hit@10
-                      ↓
-              лучший конфиг → rag_service + tools агента
+corpus (4172) + QA (148)  →  BM25 | vector | hybrid (linear, RRF)
+                                    ↓
+                         3 embed-модели (Ollama)
+                                    ↓
+                         sweep α, k ∈ {1,3,5,6,8,10,15,20}
+                                    ↓
+                         лучший конфиг → rag_service + ADK tools
 ```
 
-| Задача | Лучший метод | Модель | α | MRR@10 | Recall@10 / Hit@10 |
+| Задача | Метод | Модель | α | MRR@10 | Recall@10 / Hit@10 |
 |--------|--------------|--------|---|--------|---------------------|
-| **Чанки** (содержание) | hybrid linear | embeddinggemma | **0.6** | **0.57** | R@10 **0.86** |
-| vector | embeddinggemma | — | 0.50 | R@10 0.86 |
-| BM25 | — | — | 0.36 | R@10 0.59 |
-| **Заголовки** (статья) | vector | embeddinggemma | **1.0** | 0.45 | Hit@10 **0.73** |
-| BM25 titles | — | — | 0.16 | Hit@10 0.28 |
+| **Чанки** | hybrid linear | embeddinggemma | **0.7** | **0.577** | R@10 **0.865** |
+| чанки | vector | embeddinggemma | — | 0.543 | R@10 0.872 |
+| чанки | BM25 | — | — | 0.341 | R@10 0.547 |
+| **Заголовки** | vector | embeddinggemma | **1.0** | 0.463* | Hit@10 **0.743** |
+| заголовки | BM25 title | — | — | 0.180* | Hit@10 0.291 |
 
-**В агенте:** `search_by_chunks` α=0.6 · `search_by_titles` α=1.0 · embed **embeddinggemma** 768d
+\* MRR@20 / Hit@20 = 0.818 для vector title
+
+**В агенте:** chunks α=**0.7**, k=**8** (k=15 — 95% recall) · titles α=**1.0**, k=**10** · **embeddinggemma**  
+Полные таблицы: `01_retrieval_eval/results/` · отчёт: `EXPERIMENTS.md`
 
 ---
 
 ## 3. RAG в проде (кратко)
 
 ```
-документ → параграфный чанк (~600 сим) → PG
+документ → параграфный чанк (~600 сим) → PG (без feature_request)
 запрос   → Ollama embed → ts_rank_cd + pgvector → linear fusion
-title hit → best_chunk (DISTINCT ON по distance), не обрезок текста
+title hit → best_chunk (DISTINCT ON по distance)
 ```
 
 ---
@@ -51,11 +54,11 @@ title hit → best_chunk (DISTINCT ON по distance), не обрезок тек
 Browser :8000
     ▼
 ┌─ agent_service (ADK + LiteLLM) ─────────────────┐
-│ search_by_titles │ search_by_chunks │ open_article │
-│ workspace_list │ workspace_read │ workspace_search │
-│ preload_memory │ load_memory                        │
-│ after_tool: spill >8K → agent_workspace           │
-│ before_model: prune + LLM summary истории         │
+│ search_by_titles (α=1.0, k=10)                  │
+│ search_by_chunks (α=0.7, k=8)                   │
+│ open_article │ workspace_* │ memory              │
+│ after_tool: spill >8K → agent_workspace         │
+│ before_model: prune + LLM summary               │
 └──────────────────┬────────────────────────────────┘
                    │ :8001
 ┌─ rag_service ────┴────────────────────────────────┐

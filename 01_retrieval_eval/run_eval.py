@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 from embeddings import OllamaEmbedder
+from corpus_filter import EXCLUDED_ARTICLE_TYPES, filter_corpus
 from evaluate import aevaluate_retriever, aevaluate_hybrid_batch, filter_single_article
 from retrieval import BM25Retriever, VectorRetriever
 from retrieval.chain_rag_retriever import (
@@ -36,7 +37,13 @@ def load_corpus() -> List[dict]:
     if not path.exists():
         sys.exit(f"[ERROR] Corpus not found at {path}. Run `python download_data.py` first.")
     with path.open(encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+        raw = [json.loads(line) for line in f if line.strip()]
+    filtered = filter_corpus(raw)
+    print(
+        f"[filter] Corpus: {len(raw)} -> {len(filtered)} docs "
+        f"(excluded article_type={sorted(EXCLUDED_ARTICLE_TYPES)})"
+    )
+    return filtered
 
 
 def load_qa(dry_run: bool = False) -> List[dict]:

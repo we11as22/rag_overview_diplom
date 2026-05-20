@@ -1,8 +1,8 @@
 """ADK RAG Agent — Wix Knowledge Base Assistant.
 
-Поисковые инструменты (гибридные, лучший конфиг по бенчмарку):
-  - search_by_titles  : vector, embeddinggemma, alpha=1.0  (Hit@10=0.73)
-  - search_by_chunks  : linear hybrid, embeddinggemma, alpha=0.6  (MRR@10=0.57)
+Поисковые инструменты (конфиг из 01_retrieval_eval, см. EXPERIMENTS.md):
+  - search_by_titles  : vector, embeddinggemma, alpha=1.0, top_k=10  (Hit@10=0.74)
+  - search_by_chunks  : hybrid linear, embeddinggemma, alpha=0.7, top_k=8  (MRR@10=0.58)
   - open_article      : полный текст → PostgreSQL workspace
 
 Инструменты workspace (PostgreSQL, построчно, с fulltext-поиском):
@@ -40,8 +40,8 @@ if not os.environ.get("OPENAI_API_BASE"):
     os.environ["OPENAI_API_BASE"] = os.environ.get("LLM_API_BASE", "")
 
 _RAG_URL = os.environ.get("RAG_SERVICE_URL", "http://localhost:8001")
-_ALPHA_TITLES = 1.0
-_ALPHA_CHUNKS = 0.6
+_ALPHA_TITLES = 1.0   # vector_title, embeddinggemma — Hit@10=0.743
+_ALPHA_CHUNKS = 0.7   # hybrid_linear, embeddinggemma — MRR@10=0.577
 
 _model = os.environ["LLM_MODEL"]
 _litellm_model = _model if _model.startswith("openai/") else f"openai/{_model}"
@@ -85,15 +85,15 @@ async def search_by_titles(query: str, top_k: int = 10) -> str:
     ], ensure_ascii=False, indent=2)
 
 
-async def search_by_chunks(query: str, top_k: int = 6) -> str:
-    """Гибридный поиск по содержанию документов (hybrid linear, alpha=0.6).
+async def search_by_chunks(query: str, top_k: int = 8) -> str:
+    """Гибридный поиск по содержанию документов (hybrid linear, alpha=0.7).
 
     Ищет конкретные фрагменты текста внутри статей.
     Используй когда нужны точные шаги, настройки или детали.
 
     Args:
         query: Конкретный вопрос или аспект для поиска.
-        top_k: Количество чанков (1-15, по умолчанию 6).
+        top_k: Количество чанков (1-15, по умолчанию 8; для max recall — 15).
 
     Returns:
         JSON-список: doc_id, title, chunk_text, score.
@@ -312,8 +312,8 @@ root_agent = Agent(
 
 ## Инструменты поиска
 
-**search_by_titles(query, top_k=10)** — первый шаг для нового вопроса.
-**search_by_chunks(query, top_k=6)** — точные фрагменты и шаги.
+**search_by_titles(query, top_k=10)** — первый шаг для нового вопроса (α=1.0).
+**search_by_chunks(query, top_k=8)** — точные фрагменты и шаги (α=0.7).
 **open_article(article_id)** — полный текст статьи в workspace.
 
 Если ответ тула содержит `"status": "persisted"` и `workspace_key` — полный результат

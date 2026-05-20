@@ -6,34 +6,44 @@
 01_retrieval_eval/   бенчмарк (Chroma + Ollama)
 02_rag_agent/         rag_service + agent_service (PG + ADK)
 data/                 corpus + QA (download_data.py)
+EXPERIMENTS.md        отчёт по экспериментам и принятые конфиги
+PRESENTATION.md       слайды (копипаст)
 ```
 
 ---
 
-## Подбор retrieval
+## Принятые конфигурации (после `run_validation.py`)
 
-**Данные:** 6 221 статья, **148** single-article QA · метрика **MRR@10** / **Hit@10**
+| Компонент | Значение |
+|-----------|----------|
+| Корпус | 4 172 док. (`article` + `known_issue`, без `feature_request`) |
+| QA | 148 single-article |
+| Embed | **embeddinggemma** 768d |
+| `search_by_chunks` | hybrid linear, **α=0.7**, **top_k=8** |
+| `search_by_titles` | vector, **α=1.0**, **top_k=10** |
 
-```
-QA + corpus → BM25 | vector | hybrid (linear, RRF) × 3 embed-модели → sweep α
-```
+Подробности и таблицы экспериментов: **[EXPERIMENTS.md](EXPERIMENTS.md)**
 
-| Задача | Метод | embed | α | MRR@10 | Recall@10 / Hit@10 |
-|--------|-------|-------|---|--------|---------------------|
-| чанки | **hybrid linear** | embeddinggemma | **0.6** | **0.570** | R@10 0.858 |
-| чанки | vector | embeddinggemma | — | 0.501 | 0.865 |
-| чанки | BM25 | — | — | 0.361 | 0.588 |
-| заголовки | **vector** | embeddinggemma | **1.0** | 0.453 | Hit@10 **0.730** |
-| заголовки | BM25 | — | — | 0.164 | 0.277 |
+---
 
-Полные таблицы: `01_retrieval_eval/results/report.md`, `title_search_report.md`
+## Метрики retrieval
 
-**В rag_service:** гибрид `ts_rank_cd` + pgvector `<=>`, min-max, linear fusion; чанкинг по параграфам ~600 сим; в title-search — **best_chunk** по distance.
+| Задача | Метод | α | MRR@10 | Recall@10 / Hit@10 |
+|--------|-------|---|--------|---------------------|
+| чанки | **hybrid linear** | **0.7** | **0.577** | R@10 **0.865** |
+| чанки | vector | — | 0.543 | 0.872 |
+| чанки | BM25 | — | 0.341 | 0.547 |
+| заголовки | **vector** | **1.0** | 0.463 (MRR@10) | Hit@10 **0.743** |
+| заголовки | BM25 | — | 0.180 (@20) | 0.291 |
+
+Полные таблицы: `01_retrieval_eval/results/report.md`, `title_search_report.md`, `pick_top_k.md`
+
+**В rag_service:** гибрид `ts_rank_cd` + pgvector `<=>`, min-max, linear fusion; чанкинг ~600 сим; title-search — **best_chunk** по distance.
 
 **Запуск бенчмарка:**
 ```bash
 cd 01_retrieval_eval && python download_data.py
-python run_eval.py --skip-chain && python eval_title_search.py
+python run_validation.py
 ```
 
 ---
@@ -46,8 +56,8 @@ python run_eval.py --skip-chain && python eval_title_search.py
 agent_service ──HTTP──► rag_service ──► PostgreSQL (+ pgvector)
     │                         ▲
     │                    Ollama embeddinggemma
-    ├─ search_by_titles (α=1.0)
-    ├─ search_by_chunks (α=0.6)
+    ├─ search_by_titles (α=1.0, top_k=10)
+    ├─ search_by_chunks (α=0.7, top_k=8)
     ├─ open_article → workspace
     ├─ workspace_list / read / search
     ├─ spill tool results >8K → agent_workspace
@@ -57,11 +67,10 @@ agent_service ──HTTP──► rag_service ──► PostgreSQL (+ pgvector)
 
 | Слой | Что |
 |------|-----|
-| Поиск | конфиги из бенчмарка, два α |
-| Workspace | Postgres, построчно, FTS по строкам |
+| Поиск | конфиги из `EXPERIMENTS.md` |
+| Workspace | Postgres, построчно, FTS |
 | Контекст | `after_tool` spill, `before_model` сжатие |
 | Память | `PostgresMemoryService`, preload/load |
-| Сессии | `pgclean` in-memory до рестарта агента |
 
 ---
 
@@ -78,10 +87,10 @@ docker compose up -d postgres
 ./start.sh                    # http://localhost:8000
 
 # 4. корпус (разово)
-pip install httpx && python ingest.py
+pip install httpx && python ingest.py --clear
 ```
 
 Ollama на хосте: `ollama pull embeddinggemma`.  
-Full Docker / Apple Silicon / Ollama из контейнера — см. комментарии в `docker-compose.yml`.
+Full Docker / Apple Silicon — см. `docker-compose.yml`.
 
 **Стек:** PostgreSQL 16 + pgvector · FastAPI · Google ADK · LiteLLM · Ollama 768d

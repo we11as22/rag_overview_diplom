@@ -2,6 +2,15 @@
 
 Сравнение стратегий retrieval для дипломной работы. Датасет — [Wix/WixQA](https://huggingface.co/datasets/Wix/WixQA).
 
+## Принятые конфиги (→ `02_rag_agent`)
+
+| Инструмент | Метод | embed | α | top_k | MRR@10 / Hit@10 |
+|------------|-------|-------|---|-------|-----------------|
+| `search_by_chunks` | hybrid linear | embeddinggemma | **0.7** | **8** | MRR@10 **0.577** |
+| `search_by_titles` | vector | embeddinggemma | **1.0** | **10** | Hit@10 **0.743** |
+
+Корпус: **4172** док. (без `feature_request`), QA: **148**. Сводка: [../EXPERIMENTS.md](../EXPERIMENTS.md).
+
 ## Методы
 
 | Метод | Описание |
@@ -30,10 +39,20 @@ pip install -r requirements.txt
 # 3. Скачать датасет (~60 MB)
 python download_data.py
 
-# 4. Запустить оценку
-python run_eval.py
+# 4. Полный цикл: валидация + top_k (чанки + заголовки)
+python run_validation.py
+# или по шагам:
+# python run_eval.py --skip-chain --force-rebuild
+# python eval_title_search.py
+# python pick_top_k.py
 
-# Результаты: results/report.md, results/results.json
+# Результаты:
+#   results/report.md, results.json          — чанки, все методы
+#   results/title_search_report.md           — заголовки
+#   results/pick_top_k.md                    — рекомендуемый top_k для агента
+
+# Быстрее (одна модель):
+# python run_validation.py --models embeddinggemma
 
 # Для быстрой проверки (5 запросов):
 python run_eval.py --dry-run

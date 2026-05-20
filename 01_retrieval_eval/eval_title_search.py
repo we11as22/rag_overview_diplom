@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 from embeddings import OllamaEmbedder
+from corpus_filter import filter_corpus
 from evaluate import filter_single_article, compute_all_metrics
 
 
@@ -50,7 +51,9 @@ def load_data() -> Tuple[List[dict], List[dict]]:
             sys.exit(f"[ERROR] Not found: {p}. Run `python download_data.py` first.")
 
     with corpus_path.open() as f:
-        corpus = [json.loads(l) for l in f if l.strip()]
+        raw = [json.loads(l) for l in f if l.strip()]
+    corpus = filter_corpus(raw)
+    print(f"Corpus after filter: {len(corpus)}/{len(raw)} (no feature_request)")
     with qa_path.open() as f:
         qa = [json.loads(l) for l in f if l.strip()]
 

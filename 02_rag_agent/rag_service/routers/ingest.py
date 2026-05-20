@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import text, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from corpus_filter import EXCLUDED_ARTICLE_TYPES
 from db import get_session, Document, Chunk
 from embedder import embed_texts
 
@@ -119,7 +120,11 @@ async def ingest(req: IngestRequest, session: AsyncSession = Depends(get_session
     result = await session.execute(text("SELECT COUNT(*) FROM documents"))
     existing = result.scalar()
 
-    docs = [json.loads(l) for l in corpus_path.read_text().splitlines() if l.strip()]
+    raw = [json.loads(l) for l in corpus_path.read_text().splitlines() if l.strip()]
+    docs = [d for d in raw if d.get("article_type") not in EXCLUDED_ARTICLE_TYPES]
+    skipped = len(raw) - len(docs)
+    if skipped:
+        print(f"Skipped {skipped} docs (article_type in {sorted(EXCLUDED_ARTICLE_TYPES)})")
 
     if existing >= len(docs):
         return {"status": "already_ingested", "docs": existing}

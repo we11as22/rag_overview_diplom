@@ -8,8 +8,11 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from corpus_filter import DOC_TYPE_SQL
 from db import get_session
 from embedder import embed_query
+
+_DOC_WHERE = f"AND COALESCE(article_type, 'article') != 'feature_request'"
 
 router = APIRouter(tags=["search"])
 
@@ -50,7 +53,7 @@ async def get_article(article_id: str, session: AsyncSession = Depends(get_sessi
     """Get full article text by ID."""
     from db import Document
     doc = await session.get(Document, article_id)
-    if doc is None:
+    if doc is None or doc.article_type in ("feature_request",):
         from fastapi import HTTPException
         raise HTTPException(404, f"Article {article_id} not found")
     return ArticleResult(id=doc.id, title=doc.title, contents=doc.contents, url=doc.url)
@@ -76,6 +79,7 @@ async def hybrid_search(req: SearchRequest, session: AsyncSession = Depends(get_
                    1 - (title_vec <=> '{vec_lit}'::vector) AS vec_score
             FROM documents
             WHERE title_vec IS NOT NULL
+              {_DOC_WHERE}
             ORDER BY title_vec <=> '{vec_lit}'::vector
             LIMIT :limit
         ),
@@ -84,6 +88,7 @@ async def hybrid_search(req: SearchRequest, session: AsyncSession = Depends(get_
                    ts_rank_cd(fts, plainto_tsquery('english', :query), 32) AS bm25_score
             FROM documents
             WHERE fts @@ plainto_tsquery('english', :query)
+              {_DOC_WHERE}
             LIMIT :limit
         ),
         combined AS (
@@ -152,7 +157,9 @@ async def chunk_search(req: SearchRequest, session: AsyncSession = Depends(get_s
             SELECT c.id AS chunk_id, c.doc_id,
                    1 - (c.chunk_vec <=> '{vec_lit}'::vector) AS vec_score
             FROM chunks c
+            JOIN documents d ON d.id = c.doc_id
             WHERE c.chunk_vec IS NOT NULL
+              AND {DOC_TYPE_SQL}
             ORDER BY c.chunk_vec <=> '{vec_lit}'::vector
             LIMIT :limit
         ),
@@ -160,7 +167,9 @@ async def chunk_search(req: SearchRequest, session: AsyncSession = Depends(get_s
             SELECT c.id AS chunk_id, c.doc_id,
                    ts_rank_cd(c.fts, plainto_tsquery('english', :query), 32) AS bm25_score
             FROM chunks c
+            JOIN documents d ON d.id = c.doc_id
             WHERE c.fts @@ plainto_tsquery('english', :query)
+              AND {DOC_TYPE_SQL}
             LIMIT :limit
         ),
         combined AS (
